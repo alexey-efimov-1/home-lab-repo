@@ -2,9 +2,26 @@
 #==============================================================================
 # create-vm.sh
 # Создание ВМ в nested-KVM со статическим IP и cloud-init
-# Использование: ./create-vm.sh <имя_вм> <статический_IP> [MAC-адрес] [память_МБ] [CPU]
+# Использование: sudo ./create-vm.sh <имя_вм> <статический_IP> [MAC-адрес] [память_МБ] [CPU]
 #==============================================================================
 set -euo pipefail
+
+#------------------------------------------------------------------------------
+# Определение реального пользователя и его домашней директории
+#------------------------------------------------------------------------------
+if [[ -n "${SUDO_USER:-}" ]]; then
+    REAL_USER="$SUDO_USER"
+    REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+else
+    REAL_USER="$(whoami)"
+    REAL_HOME="$HOME"
+fi
+
+if [[ -z "$REAL_HOME" || ! -d "$REAL_HOME" ]]; then
+    echo "[ERROR] Не удалось определить домашнюю директорию пользователя '$REAL_USER'." >&2
+    exit 1
+fi
+
 #------------------------------------------------------------------------------
 # Параметры по умолчанию
 #------------------------------------------------------------------------------
@@ -19,7 +36,7 @@ VCPUS="${5:-1}"
 #------------------------------------------------------------------------------
 readonly LIBVIRT_DIR="/var/lib/libvirt/images"
 readonly BASE_IMG="${LIBVIRT_DIR}/noble-server-cloudimg-amd64.img"
-readonly SSH_KEY_FILE="${SSH_KEY_FILE:-$HOME/.ssh/id_ed25519.pub}"
+readonly SSH_KEY_FILE="${SSH_KEY_FILE:-${REAL_HOME}/.ssh/id_ed25519.pub}"
 readonly GATEWAY="192.168.122.1"
 readonly NET_NAME="default"
 readonly DISK_SIZE="20G"
@@ -37,17 +54,24 @@ cleanup() {
 trap cleanup EXIT
 
 #------------------------------------------------------------------------------
+# Проверка прав суперпользователя
+#------------------------------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+  error "Скрипт требует прав root для работы с libvirt."
+  error "Запустите с помощью: sudo $0 $*"
+  exit 1
+fi
+
+#------------------------------------------------------------------------------
 # Проверки
 #------------------------------------------------------------------------------
 log "Проверка параметров..."
 
-# Валидация формата IP
 if ! [[ "$VM_IP" =~ ^192\.168\.122\.[0-9]{1,3}$ ]]; then
   error "IP должен быть в подсети 192.168.122.0/24"
   exit 1
 fi
 
-# Проверка, что статический IP не попадает в DHCP-пул
 IP_LAST="${VM_IP##*.}"
 if [[ "$IP_LAST" -ge 100 && "$IP_LAST" -le 200 ]]; then
   error "Внимание: IP $VM_IP попадает в DHCP-диапазон (100-200). Рекомендуется использовать 2-99."
@@ -56,25 +80,22 @@ if [[ "$IP_LAST" -ge 100 && "$IP_LAST" -le 200 ]]; then
   [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 1
 fi
 
-# Проверка зависимостей
 for cmd in virt-install cloud-localds virsh qemu-img; do
   command -v "$cmd" &>/dev/null || { error "Не найдена зависимость: $cmd"; exit 1; }
 done
 
-# Проверка базового образа
 if [[ ! -f "$BASE_IMG" ]]; then
   error "Базовый образ не найден. Запустите сначала: sudo ./setup-jumpbox.sh"
   exit 1
 fi
 
-# Проверка SSH-ключа
 if [[ ! -f "$SSH_KEY_FILE" ]]; then
   error "SSH-ключ не найден: $SSH_KEY_FILE"
-  error "Сгенерируйте его: ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519"
+  error "Убедитесь, что пользователь '$REAL_USER' имеет ключ в ~/.ssh/id_ed25519.pub"
+  error "Или сгенерируйте его от имени '$REAL_USER': ssh-keygen -t ed25519"
   exit 1
 fi
 
-# Проверка, что ВМ ещё не существует
 if virsh domstate "$VM_NAME" &>/dev/null; then
   error "ВМ '$VM_NAME' уже существует."
   error "Удалите её: virsh undefine $VM_NAME --remove-all-storage"
@@ -116,19 +137,14 @@ users:
     ssh_authorized_keys:
       - ${SSH_PUBLIC_KEY}
     lock_passwd: true
-
-network:
-  version: 2
-  ethernets:
-    eth0:
-      dhcp4: false
-      addresses:
-        - ${VM_IP}/24
-      routes:
-        - to: default
-          via: ${GATEWAY}
-      nameservers:
-        addresses: [8.8.8.8, 1.1.1.1, 9.9.9.9]
+  - name: ansible
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${SSH_PUBLIC_KEY}
+    lock_passwd: true
+    groups: sudo
+    create_home: true
 
 package_update: true
 package_upgrade: false
@@ -138,6 +154,9 @@ packages:
   - vim
   - wget
   - git
+  - python3
+  - python3-pip
+  - python3-venv
 
 runcmd:
   - systemctl enable ssh
@@ -200,7 +219,8 @@ echo "ВМ '${VM_NAME}' успешно создана"
 echo "=========================================="
 echo "IP-адрес:     ${VM_IP}"
 echo "MAC-адрес:    ${VM_MAC}"
-echo "SSH:          ssh ubuntu@${VM_IP}"
+echo "SSH (ubuntu): ssh ubuntu@${VM_IP}"
+echo "SSH (ansible):ssh ansible@${VM_IP}"
 echo "Консоль:      virsh console ${VM_NAME}"
 echo "Статус:       $(virsh domstate "$VM_NAME")"
 echo "=========================================="

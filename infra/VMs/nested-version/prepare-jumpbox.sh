@@ -1,171 +1,232 @@
 #!/usr/bin/env bash
 #==============================================================================
-# Подготовка Ubuntu-хоста для вложенной виртуализации (nested KVM)
-# Запускается ЕДИНОЖДЫ на jumpbox после первой загрузки
+# create-vm.sh
+# Создание ВМ в nested-KVM со статическим IP и cloud-init
+# Использование: sudo ./create-vm.sh <имя_вм> <статический_IP> [MAC-адрес] [память_МБ] [CPU]
 #==============================================================================
 set -euo pipefail
+
+#------------------------------------------------------------------------------
+# Определение реального пользователя и его домашней директории
+#------------------------------------------------------------------------------
+if [[ -n "${SUDO_USER:-}" ]]; then
+    REAL_USER="$SUDO_USER"
+    REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+else
+    REAL_USER="$(whoami)"
+    REAL_HOME="$HOME"
+fi
+
+if [[ -z "$REAL_HOME" || ! -d "$REAL_HOME" ]]; then
+    echo "[ERROR] Не удалось определить домашнюю директорию пользователя '$REAL_USER'." >&2
+    exit 1
+fi
+
+#------------------------------------------------------------------------------
+# Параметры по умолчанию
+#------------------------------------------------------------------------------
+VM_NAME="${1:?Ошибка: укажите имя ВМ. Пример: $0 web-01 192.168.122.10}"
+VM_IP="${2:?Ошибка: укажите статический IP. Пример: $0 web-01 192.168.122.10}"
+VM_MAC="${3:-52:54:00:$(printf '%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))}"
+RAM="${4:-1024}"
+VCPUS="${5:-1}"
+
 #------------------------------------------------------------------------------
 # Константы
 #------------------------------------------------------------------------------
 readonly LIBVIRT_DIR="/var/lib/libvirt/images"
-readonly BASE_IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 readonly BASE_IMG="${LIBVIRT_DIR}/noble-server-cloudimg-amd64.img"
-readonly NET_NAME="default"
+readonly SSH_KEY_FILE="${SSH_KEY_FILE:-${REAL_HOME}/.ssh/id_ed25519.pub}"
 readonly GATEWAY="192.168.122.1"
-readonly DHCP_RANGE_START="192.168.122.100"
-readonly DHCP_RANGE_END="192.168.122.200"
+readonly NET_NAME="default"
+readonly DISK_SIZE="20G"
 
 #------------------------------------------------------------------------------
 # Вспомогательные функции
 #------------------------------------------------------------------------------
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 error() { echo "[ERROR] $*" >&2; }
+cleanup() { 
+  if [[ -n "${WORK_DIR:-}" && -d "$WORK_DIR" ]]; then
+    rm -rf "$WORK_DIR"
+  fi
+}
+trap cleanup EXIT
 
 #------------------------------------------------------------------------------
 # Проверка прав суперпользователя
 #------------------------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
-  error "Run script with sudo: sudo $0"
-  exit 1
-fi
-
-# Определяем реального пользователя и его домашнюю директорию
-REAL_USER="${SUDO_USER:-$(whoami)}"
-REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
-SSH_DIR="$REAL_HOME/.ssh"
-SSH_KEY="$SSH_DIR/id_ed25519"
-
-if [[ -z "$REAL_HOME" || ! -d "$REAL_HOME" ]]; then
-  error "Не удалось определить домашнюю директорию пользователя '$REAL_USER'."
+  error "Скрипт требует прав root для работы с libvirt."
+  error "Запустите с помощью: sudo $0 $*"
   exit 1
 fi
 
 #------------------------------------------------------------------------------
-# 1. Установка зависимостей
+# Проверки
 #------------------------------------------------------------------------------
-log "Обновление пакетов и установка зависимостей..."
-apt update -qq
-apt install -y -qq \
-  qemu-kvm libvirt-daemon-system libvirt-clients \
-  cloud-image-utils virtinst genisoimage \
-  iptables-persistent netfilter-persistent \
-  curl wget git openssh-client >/dev/null
+log "Проверка параметров..."
 
-#------------------------------------------------------------------------------
-# 2. Проверка вложенной виртуализации
-#------------------------------------------------------------------------------
-log "Проверка поддержки вложенной виртуализации..."
-if ! command -v kvm-ok &>/dev/null || ! kvm-ok &>/dev/null; then
-  error "KVM не доступен. Включите Nested VT-x/AMD-V в настройках VirtualBox:"
-  error "  Settings -> System -> Processor -> Enable Nested VT-x/AMD-V"
-  error "Перезагрузите ВМ и запустите скрипт повторно."
-  exit 1
-fi
-log "Поддержка KVM подтверждена."
-
-#------------------------------------------------------------------------------
-# 3. Генерация SSH-ключа (если отсутствует)
-#------------------------------------------------------------------------------
-log "Проверка SSH-ключа для пользователя '$REAL_USER'..."
-if [[ ! -f "$SSH_KEY" ]]; then
-  log "Генерация пары ключей: $SSH_KEY"
-  mkdir -p "$SSH_DIR"
-  ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -C "${REAL_USER}@jumpbox"
-  chown -R "$REAL_USER":"$REAL_USER" "$SSH_DIR"
-  chmod 700 "$SSH_DIR"
-  chmod 600 "$SSH_KEY"
-  chmod 644 "${SSH_KEY}.pub"
-  log "SSH-ключ успешно создан."
-else
-  log "SSH-ключ уже существует: $SSH_KEY"
-fi
-
-#------------------------------------------------------------------------------
-# 4. Настройка прав доступа к libvirt
-#------------------------------------------------------------------------------
-log "Добавление пользователя '$REAL_USER' в группу libvirt..."
-usermod -aG libvirt "$REAL_USER"
-log "Пользователь добавлен. Для применения изменений выполните: newgrp libvirt"
-log "Либо выйдите из системы и зайдите заново."
-
-#------------------------------------------------------------------------------
-# 5. Включение IP-форвардинга и настройка NAT
-#------------------------------------------------------------------------------
-log "Настройка IP-форвардинга и правил iptables..."
-
-echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-nested-virt.conf
-sysctl -p /etc/sysctl.d/99-nested-virt.conf >/dev/null
-
-EXT_IF=$(ip route | grep default | awk '{print $5}' | head -1)
-if [[ -z "$EXT_IF" ]]; then
-  error "Не удалось определить внешний сетевой интерфейс."
-  exit 1
-fi
-log "Внешний интерфейс: $EXT_IF"
-
-# Очистка старых правил для идемпотентности
-iptables -t nat -F POSTROUTING 2>/dev/null || true
-iptables -F FORWARD 2>/dev/null || true
-
-# Разрешение маскарадинга и перенаправления трафика
-iptables -t nat -A POSTROUTING -s "${GATEWAY%.*}.0/24" -o "$EXT_IF" -j MASQUERADE
-iptables -A FORWARD -i "$EXT_IF" -o virbr0 -m state --state RELATED,ESTABLISHED -j ACCEPT
-iptables -A FORWARD -i virbr0 -o "$EXT_IF" -j ACCEPT
-
-# Сохранение правил
-netfilter-persistent save >/dev/null 2>&1 || true
-systemctl enable --now netfilter-persistent >/dev/null 2>&1 || true
-
-log "NAT и правила перенаправления сохранены."
-
-#------------------------------------------------------------------------------
-# 6. Настройка DHCP-диапазона libvirt (чтобы не конфликтовал со статикой)
-#------------------------------------------------------------------------------
-log "Проверка конфигурации сети libvirt..."
-
-if ! virsh net-info "$NET_NAME" &>/dev/null; then
-  error "Сеть '$NET_NAME' не найдена. Убедитесь, что libvirt запущен."
+if ! [[ "$VM_IP" =~ ^192\.168\.122\.[0-9]{1,3}$ ]]; then
+  error "IP должен быть в подсети 192.168.122.0/24"
   exit 1
 fi
 
-CURRENT_CONFIG=$(virsh net-dumpxml "$NET_NAME")
-if ! echo "$CURRENT_CONFIG" | grep -q "${DHCP_RANGE_START}"; then
-  log "Обновление DHCP-диапазона: ${DHCP_RANGE_START}-${DHCP_RANGE_END}"
-  
-  TEMP_XML=$(mktemp)
-  echo "$CURRENT_CONFIG" | sed \
-    -e "s|<range start='[^']*' end='[^']*'/>|<range start='${DHCP_RANGE_START}' end='${DHCP_RANGE_END}'/>|g" \
-    > "$TEMP_XML"
-  
-  virsh net-define "$TEMP_XML" >/dev/null
-  rm -f "$TEMP_XML"
-  
-  virsh net-destroy "$NET_NAME" >/dev/null 2>&1 || true
-  virsh net-start "$NET_NAME" >/dev/null
-else
-  log "DHCP-диапазон уже настроен корректно."
+IP_LAST="${VM_IP##*.}"
+if [[ "$IP_LAST" -ge 100 && "$IP_LAST" -le 200 ]]; then
+  error "Внимание: IP $VM_IP попадает в DHCP-диапазон (100-200). Рекомендуется использовать 2-99."
+  read -p "Продолжить? [y/N] " -n 1 -r < /dev/tty || true
+  echo
+  [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 1
 fi
 
-#------------------------------------------------------------------------------
-# 7. Скачивание базового облачного образа
-#------------------------------------------------------------------------------
+for cmd in virt-install cloud-localds virsh qemu-img; do
+  command -v "$cmd" &>/dev/null || { error "Не найдена зависимость: $cmd"; exit 1; }
+done
+
 if [[ ! -f "$BASE_IMG" ]]; then
-  log "Скачивание базового образа Ubuntu (~500 МБ)..."
-  mkdir -p "$LIBVIRT_DIR"
-  curl -L -o "$BASE_IMG" "$BASE_IMG_URL"
-  chmod 644 "$BASE_IMG"
-  log "Образ сохранён: $BASE_IMG"
-else
-  log "Базовый образ уже существует: $BASE_IMG"
+  error "Базовый образ не найден. Запустите сначала: sudo ./setup-jumpbox.sh"
+  exit 1
+fi
+
+if [[ ! -f "$SSH_KEY_FILE" ]]; then
+  error "SSH-ключ не найден: $SSH_KEY_FILE"
+  error "Убедитесь, что пользователь '$REAL_USER' имеет ключ в ~/.ssh/id_ed25519.pub"
+  error "Или сгенерируйте его от имени '$REAL_USER': ssh-keygen -t ed25519"
+  exit 1
+fi
+
+if virsh domstate "$VM_NAME" &>/dev/null; then
+  error "ВМ '$VM_NAME' уже существует."
+  error "Удалите её: virsh undefine $VM_NAME --remove-all-storage"
+  exit 1
 fi
 
 #------------------------------------------------------------------------------
-# 8. Итоговое сообщение
+# Подготовка рабочей директории
+#------------------------------------------------------------------------------
+WORK_DIR="${LIBVIRT_DIR}/.staging/${VM_NAME}-$(date +%s)"
+mkdir -p "$WORK_DIR"
+log "Рабочая директория: $WORK_DIR"
+
+#------------------------------------------------------------------------------
+# 1. Создание диска ВМ
+#------------------------------------------------------------------------------
+log "Создание диска ВМ..."
+VM_DISK="${LIBVIRT_DIR}/${VM_NAME}.qcow2"
+cp "$BASE_IMG" "$VM_DISK"
+qemu-img resize "$VM_DISK" "$DISK_SIZE" >/dev/null
+chown libvirt-qemu:kvm "$VM_DISK" 2>/dev/null || true
+
+#------------------------------------------------------------------------------
+# 2. Генерация cloud-init конфигурации
+#------------------------------------------------------------------------------
+log "Генерация cloud-init конфигурации..."
+
+SSH_PUBLIC_KEY=$(cat "$SSH_KEY_FILE")
+
+cat > "${WORK_DIR}/user-data" <<EOF
+#cloud-config
+hostname: ${VM_NAME}
+manage_etc_hosts: true
+
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${SSH_PUBLIC_KEY}
+    lock_passwd: true
+  - name: ansible
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - ${SSH_PUBLIC_KEY}
+    lock_passwd: true
+    groups: sudo
+    create_home: true
+
+package_update: true
+package_upgrade: false
+packages:
+  - openssh-server
+  - curl
+  - vim
+  - wget
+  - git
+  - python3
+  - python3-pip
+  - python3-venv
+
+runcmd:
+  - systemctl enable ssh
+  - systemctl restart ssh
+
+final_message: "ВМ ${VM_NAME} (${VM_IP}) успешно инициализирована"
+EOF
+
+cat > "${WORK_DIR}/meta-data" <<EOF
+instance-id: ${VM_NAME}-$(date +%s)
+local-hostname: ${VM_NAME}
+EOF
+
+#------------------------------------------------------------------------------
+# 3. Создание seed-ISO для cloud-init
+#------------------------------------------------------------------------------
+log "Создание cloud-init seed-ISO..."
+cloud-localds "${WORK_DIR}/seed.iso" "${WORK_DIR}/user-data" "${WORK_DIR}/meta-data"
+chown libvirt-qemu:kvm "${WORK_DIR}/seed.iso" 2>/dev/null || true
+
+#------------------------------------------------------------------------------
+# 4. Запуск ВМ через virt-install
+#------------------------------------------------------------------------------
+log "Запуск ВМ '$VM_NAME' (IP: $VM_IP, MAC: $VM_MAC, RAM: ${RAM}MB, CPU: $VCPUS)..."
+
+virt-install \
+  --name "$VM_NAME" \
+  --memory "$RAM" \
+  --vcpus "$VCPUS" \
+  --disk path="$VM_DISK",format=qcow2 \
+  --disk path="${WORK_DIR}/seed.iso",device=cdrom,readonly=on \
+  --os-variant ubuntu24.04 \
+  --import \
+  --network network="$NET_NAME",mac="$VM_MAC" \
+  --graphics none \
+  --console pty,target_type=serial \
+  --noautoconsole
+
+virsh autostart "$VM_NAME" >/dev/null 2>&1 || true
+
+#------------------------------------------------------------------------------
+# 5. Ожидание запуска
+#------------------------------------------------------------------------------
+log "Ожидание запуска ВМ (до 90 сек)..."
+
+for i in {1..45}; do
+  if virsh domstate "$VM_NAME" 2>/dev/null | grep -q "running"; then
+    log "ВМ запущена."
+    break
+  fi
+  sleep 2
+done
+
+#------------------------------------------------------------------------------
+# 6. Финальный вывод
 #------------------------------------------------------------------------------
 echo ""
-log "Настройка завершена."
+echo "=========================================="
+echo "ВМ '${VM_NAME}' успешно создана"
+echo "=========================================="
+echo "IP-адрес:     ${VM_IP}"
+echo "MAC-адрес:    ${VM_MAC}"
+echo "SSH (ubuntu): ssh ubuntu@${VM_IP}"
+echo "SSH (ansible):ssh ansible@${VM_IP}"
+echo "Консоль:      virsh console ${VM_NAME}"
+echo "Статус:       $(virsh domstate "$VM_NAME")"
+echo "=========================================="
 echo ""
-echo "Дальнейшие действия:"
-echo "  1. Примените изменения группы: newgrp libvirt (или перелогиньтесь)"
-echo "  2. Создавайте ВМ: ./create-vm.sh <имя> <статический_ip> [mac] [ram_mb] [vcpus]"
-echo "  3. Пример: ./create-vm.sh web-01 192.168.122.10"
+echo "Полезные команды:"
+echo "  Проверить доступность: ping -c 2 ${VM_IP}"
+echo "  Посмотреть логи:       virsh console ${VM_NAME}  (выход: Ctrl + ])"
+echo "  Остановить:            virsh shutdown ${VM_NAME}"
+echo "  Удалить:               virsh undefine ${VM_NAME} --remove-all-storage"

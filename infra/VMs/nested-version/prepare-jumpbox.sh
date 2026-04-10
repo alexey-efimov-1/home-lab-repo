@@ -17,7 +17,7 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 error() { echo "[ERROR] $*" >&2; exit 1; }
 
 if [[ $EUID -ne 0 ]]; then
-    error "Запустите скрипт с правами root: sudo $0"
+    error "Запустите скрипт с SUDO: sudo $0"
 fi
 
 REAL_USER="${SUDO_USER:-$(whoami)}"
@@ -30,33 +30,35 @@ if [[ -z "$REAL_HOME" || ! -d "$REAL_HOME" ]]; then
 fi
 
 #------------------------------------------------------------------------------
-# 1. Сервисы и зависимости
+# 1. Установка зависимостей
 #------------------------------------------------------------------------------
-log "Запуск и включение libvirtd..."
-systemctl enable --now libvirtd >/dev/null 2>&1 || true
-
 log "Обновление пакетов и установка зависимостей..."
 apt update -qq
 apt install -y -qq \
-    cpu-checker qemu-kvm libvirt-daemon-system libvirt-clients \
+    cpu-checker \
+    qemu-kvm libvirt-daemon-system libvirt-clients \
     cloud-image-utils virtinst genisoimage \
-    curl wget git openssh-client >/dev/null 2>&1
+    curl wget git openssh-client >/dev/null
 
+#------------------------------------------------------------------------------
+# 2. Проверка KVM
+#------------------------------------------------------------------------------
 log "Проверка поддержки вложенной виртуализации..."
-if ! command -v kvm-ok &>/dev/null || ! kvm-ok &>/dev/null; then
+# Теперь kvm-ok точно установлен благодаря cpu-checker выше
+if ! kvm-ok &>/dev/null; then
     error "KVM не доступен. Включите Nested VT-x/AMD-V в настройках гипервизора."
     error "Перезагрузите ВМ и запустите скрипт повторно."
 fi
 log "Поддержка KVM подтверждена."
 
 #------------------------------------------------------------------------------
-# 2. SSH-ключи
+# 3. SSH-ключи
 #------------------------------------------------------------------------------
 log "Проверка SSH-ключа для пользователя '$REAL_USER'..."
 if [[ ! -f "$SSH_KEY" ]]; then
     log "Генерация пары ключей: $SSH_KEY"
     mkdir -p "$SSH_DIR"
-    ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -C "${REAL_USER}@jumpbox" >/dev/null 2>&1
+    ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" -C "${REAL_USER}@jumpbox" >/dev/null
     chown -R "$REAL_USER":"$REAL_USER" "$SSH_DIR"
     chmod 700 "$SSH_DIR"
     chmod 600 "$SSH_KEY"
@@ -67,11 +69,11 @@ else
 fi
 
 log "Добавление пользователя '$REAL_USER' в группу libvirt..."
-usermod -aG libvirt "$REAL_USER" >/dev/null 2>&1
+usermod -aG libvirt "$REAL_USER"
 log "Для применения изменений выполните: newgrp libvirt"
 
 #------------------------------------------------------------------------------
-# 3. Сеть и Firewall
+# 4. Сетевые настройки
 #------------------------------------------------------------------------------
 log "Включение IP-форвардинга..."
 echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-nested-virt.conf
@@ -86,28 +88,33 @@ if command -v ufw &>/dev/null && ufw status | grep -q "active"; then
     log "UFW настроен для проброса трафика."
 fi
 
-log "Настройка DHCP-диапазона сети libvirt..."
+log "Проверка DHCP-диапазона сети libvirt..."
 if ! virsh net-info "$NET_NAME" &>/dev/null; then
-    error "Сеть '$NET_NAME' не найдена. Убедитесь, что libvirtd запущен."
+    error "Сеть '$NET_NAME' не найдена. Убедитесь, что libvirt запущен."
 fi
 
-# Атомарное обновление без разрыва сети (безопаснее, чем net-destroy/start)
-virsh net-update "$NET_NAME" modify ip-dhcp-range \
-    "<range start='${DHCP_RANGE_START}' end='${DHCP_RANGE_END}'/>" \
-    --live --config 2>/dev/null || {
-    log "DHCP-диапазон уже настроен корректно или не требует изменений."
-}
+CURRENT_CONFIG=$(virsh net-dumpxml "$NET_NAME")
+if ! echo "$CURRENT_CONFIG" | grep -q "${DHCP_RANGE_START}"; then
+    log "Обновление DHCP-диапазона: ${DHCP_RANGE_START}-${DHCP_RANGE_END}"
+    TEMP_XML=$(mktemp)
+    echo "$CURRENT_CONFIG" | sed \
+        -e "s|<range start='[^']*' end='[^']*'/>|<range start='${DHCP_RANGE_START}' end='${DHCP_RANGE_END}'/>|g" \
+        > "$TEMP_XML"
+    virsh net-define "$TEMP_XML" >/dev/null
+    rm -f "$TEMP_XML"
+    virsh net-destroy "$NET_NAME" >/dev/null 2>&1 || true
+    virsh net-start "$NET_NAME" >/dev/null
+else
+    log "DHCP-диапазон уже настроен корректно."
+fi
 
 #------------------------------------------------------------------------------
-# 4. Базовый образ
+# 5. Базовый образ
 #------------------------------------------------------------------------------
 if [[ ! -f "$BASE_IMG" ]]; then
     log "Скачивание базового образа Ubuntu (~500 МБ)..."
     mkdir -p "$LIBVIRT_DIR"
-    curl -L --connect-timeout 10 --max-time 600 --progress-bar -o "$BASE_IMG" "$BASE_IMG_URL" || {
-        rm -f "$BASE_IMG"
-        error "Ошибка загрузки образа. Проверьте интернет-соединение."
-    }
+    curl -L -o "$BASE_IMG" "$BASE_IMG_URL"
     chmod 644 "$BASE_IMG"
     log "Образ сохранён: $BASE_IMG"
 else

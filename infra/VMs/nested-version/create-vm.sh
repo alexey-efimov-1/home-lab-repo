@@ -16,7 +16,6 @@ else
     REAL_USER="$(whoami)"
     REAL_HOME="$HOME"
 fi
-
 if [[ -z "$REAL_HOME" || ! -d "$REAL_HOME" ]]; then
     echo "[ERROR] Не удалось определить домашнюю директорию пользователя '$REAL_USER'." >&2
     exit 1
@@ -45,11 +44,11 @@ readonly DISK_SIZE="20G"
 # Вспомогательные функции
 #------------------------------------------------------------------------------
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
-error() { echo "[ERROR] $*" >&2; }
-cleanup() { 
-  if [[ -n "${WORK_DIR:-}" && -d "$WORK_DIR" ]]; then
-    rm -rf "$WORK_DIR"
-  fi
+error() { echo "[ERROR] $*" >&2; exit 1; }
+cleanup() {
+    if [[ -n "${WORK_DIR:-}" && -d "$WORK_DIR" ]]; then
+        rm -rf "$WORK_DIR"
+    fi
 }
 trap cleanup EXIT
 
@@ -57,49 +56,38 @@ trap cleanup EXIT
 # Проверка прав суперпользователя
 #------------------------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
-  error "Скрипт требует прав root для работы с libvirt."
-  error "Запустите с помощью: sudo $0 $*"
-  exit 1
+    error "Скрипт требует прав root для работы с libvirt."
+    error "Запустите с помощью: sudo $0 $*"
 fi
 
 #------------------------------------------------------------------------------
 # Проверки
 #------------------------------------------------------------------------------
 log "Проверка параметров..."
-
 if ! [[ "$VM_IP" =~ ^192\.168\.122\.[0-9]{1,3}$ ]]; then
-  error "IP должен быть в подсети 192.168.122.0/24"
-  exit 1
+    error "IP должен быть в подсети 192.168.122.0/24"
 fi
-
 IP_LAST="${VM_IP##*.}"
 if [[ "$IP_LAST" -ge 100 && "$IP_LAST" -le 200 ]]; then
-  error "Внимание: IP $VM_IP попадает в DHCP-диапазон (100-200). Рекомендуется использовать 2-99."
-  read -p "Продолжить? [y/N] " -n 1 -r < /dev/tty || true
-  echo
-  [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 1
+    echo "[WARNING] IP $VM_IP попадает в DHCP-диапазон (100-200). Рекомендуется использовать 2-99."
+    read -p "Продолжить? [y/N] " -n 1 -r < /dev/tty || true
+    echo
+    [[ ! "$REPLY" =~ ^[Yy]$ ]] && exit 1
 fi
-
 for cmd in virt-install cloud-localds virsh qemu-img; do
-  command -v "$cmd" &>/dev/null || { error "Не найдена зависимость: $cmd"; exit 1; }
+    command -v "$cmd" &>/dev/null || { error "Не найдена зависимость: $cmd"; }
 done
-
 if [[ ! -f "$BASE_IMG" ]]; then
-  error "Базовый образ не найден. Запустите сначала: sudo ./setup-jumpbox.sh"
-  exit 1
+    error "Базовый образ не найден. Запустите сначала: sudo ./prepare-jumpbox.sh"
 fi
-
 if [[ ! -f "$SSH_KEY_FILE" ]]; then
-  error "SSH-ключ не найден: $SSH_KEY_FILE"
-  error "Убедитесь, что пользователь '$REAL_USER' имеет ключ в ~/.ssh/id_ed25519.pub"
-  error "Или сгенерируйте его от имени '$REAL_USER': ssh-keygen -t ed25519"
-  exit 1
+    error "SSH-ключ не найден: $SSH_KEY_FILE"
+    error "Убедитесь, что пользователь '$REAL_USER' имеет ключ в ~/.ssh/id_ed25519.pub"
+    error "Или сгенерируйте его от имени '$REAL_USER': ssh-keygen -t ed25519"
 fi
-
 if virsh domstate "$VM_NAME" &>/dev/null; then
-  error "ВМ '$VM_NAME' уже существует."
-  error "Удалите её: virsh undefine $VM_NAME --remove-all-storage"
-  exit 1
+    error "ВМ '$VM_NAME' уже существует."
+    error "Удалите её: virsh undefine $VM_NAME --remove-all-storage"
 fi
 
 #------------------------------------------------------------------------------
@@ -110,26 +98,23 @@ mkdir -p "$WORK_DIR"
 log "Рабочая директория: $WORK_DIR"
 
 #------------------------------------------------------------------------------
-# 1. Создание диска ВМ
+# 1. Создание диска ВМ (backing-file для экономии места)
 #------------------------------------------------------------------------------
 log "Создание диска ВМ..."
 VM_DISK="${LIBVIRT_DIR}/${VM_NAME}.qcow2"
-cp "$BASE_IMG" "$VM_DISK"
-qemu-img resize "$VM_DISK" "$DISK_SIZE" >/dev/null
+qemu-img create -f qcow2 -b "$BASE_IMG" -F qcow2 "$VM_DISK" "$DISK_SIZE" >/dev/null
 chown libvirt-qemu:kvm "$VM_DISK" 2>/dev/null || true
 
 #------------------------------------------------------------------------------
 # 2. Генерация cloud-init конфигурации
 #------------------------------------------------------------------------------
 log "Генерация cloud-init конфигурации..."
-
 SSH_PUBLIC_KEY=$(cat "$SSH_KEY_FILE")
 
 cat > "${WORK_DIR}/user-data" <<EOF
 #cloud-config
 hostname: ${VM_NAME}
 manage_etc_hosts: true
-
 users:
   - name: ubuntu
     sudo: ALL=(ALL) NOPASSWD:ALL
@@ -145,7 +130,6 @@ users:
     lock_passwd: true
     groups: sudo
     create_home: true
-
 package_update: true
 package_upgrade: false
 packages:
@@ -157,11 +141,9 @@ packages:
   - python3
   - python3-pip
   - python3-venv
-
 runcmd:
   - systemctl enable ssh
   - systemctl restart ssh
-
 final_message: "ВМ ${VM_NAME} (${VM_IP}) успешно инициализирована"
 EOF
 
@@ -170,44 +152,60 @@ instance-id: ${VM_NAME}-$(date +%s)
 local-hostname: ${VM_NAME}
 EOF
 
+cat > "${WORK_DIR}/network-config" <<EOF
+version: 2
+ethernets:
+  ens3:
+    match:
+      macaddress: ${VM_MAC}
+    dhcp4: false
+    addresses:
+      - ${VM_IP}/24
+    routes:
+      - to: default
+        via: ${GATEWAY}
+    nameservers:
+      addresses: [8.8.8.8, 1.1.1.1]
+EOF
+
 #------------------------------------------------------------------------------
 # 3. Создание seed-ISO для cloud-init
 #------------------------------------------------------------------------------
 log "Создание cloud-init seed-ISO..."
-cloud-localds "${WORK_DIR}/seed.iso" "${WORK_DIR}/user-data" "${WORK_DIR}/meta-data"
+cloud-localds "${WORK_DIR}/seed.iso" \
+    "${WORK_DIR}/user-data" \
+    "${WORK_DIR}/meta-data" \
+    "${WORK_DIR}/network-config"
 chown libvirt-qemu:kvm "${WORK_DIR}/seed.iso" 2>/dev/null || true
 
 #------------------------------------------------------------------------------
 # 4. Запуск ВМ через virt-install
 #------------------------------------------------------------------------------
 log "Запуск ВМ '$VM_NAME' (IP: $VM_IP, MAC: $VM_MAC, RAM: ${RAM}MB, CPU: $VCPUS)..."
-
 virt-install \
-  --name "$VM_NAME" \
-  --memory "$RAM" \
-  --vcpus "$VCPUS" \
-  --disk path="$VM_DISK",format=qcow2 \
-  --disk path="${WORK_DIR}/seed.iso",device=cdrom,readonly=on \
-  --os-variant ubuntu24.04 \
-  --import \
-  --network network="$NET_NAME",mac="$VM_MAC" \
-  --graphics none \
-  --console pty,target_type=serial \
-  --noautoconsole
-
+    --name "$VM_NAME" \
+    --memory "$RAM" \
+    --vcpus "$VCPUS" \
+    --disk path="$VM_DISK",format=qcow2 \
+    --disk path="${WORK_DIR}/seed.iso",device=cdrom,readonly=on \
+    --os-variant ubuntu24.04 \
+    --import \
+    --network network="$NET_NAME",mac="$VM_MAC" \
+    --graphics none \
+    --console pty,target_type=serial \
+    --noautoconsole >/dev/null 2>&1
 virsh autostart "$VM_NAME" >/dev/null 2>&1 || true
 
 #------------------------------------------------------------------------------
 # 5. Ожидание запуска
 #------------------------------------------------------------------------------
 log "Ожидание запуска ВМ (до 90 сек)..."
-
 for i in {1..45}; do
-  if virsh domstate "$VM_NAME" 2>/dev/null | grep -q "running"; then
-    log "ВМ запущена."
-    break
-  fi
-  sleep 2
+    if virsh domstate "$VM_NAME" 2>/dev/null | grep -q "running"; then
+        log "ВМ запущена."
+        break
+    fi
+    sleep 2
 done
 
 #------------------------------------------------------------------------------

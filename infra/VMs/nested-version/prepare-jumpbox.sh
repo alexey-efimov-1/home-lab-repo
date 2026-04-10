@@ -17,7 +17,7 @@ log() { echo "[$(date '+%H:%M:%S')] $*"; }
 error() { echo "[ERROR] $*" >&2; exit 1; }
 
 if [[ $EUID -ne 0 ]]; then
-    error "Run this script with sudo: sudo $0"
+    error "Запустите скрипт с правами root: sudo $0"
 fi
 
 REAL_USER="${SUDO_USER:-$(whoami)}"
@@ -29,6 +29,12 @@ if [[ -z "$REAL_HOME" || ! -d "$REAL_HOME" ]]; then
     error "Не удалось определить домашнюю директорию пользователя '$REAL_USER'."
 fi
 
+#------------------------------------------------------------------------------
+# 1. Сервисы и зависимости
+#------------------------------------------------------------------------------
+log "Запуск и включение libvirtd..."
+systemctl enable --now libvirtd >/dev/null 2>&1 || true
+
 log "Обновление пакетов и установка зависимостей..."
 apt update -qq
 apt install -y -qq \
@@ -37,12 +43,15 @@ apt install -y -qq \
     curl wget git openssh-client >/dev/null 2>&1
 
 log "Проверка поддержки вложенной виртуализации..."
-if ! kvm-ok &>/dev/null; then
+if ! command -v kvm-ok &>/dev/null || ! kvm-ok &>/dev/null; then
     error "KVM не доступен. Включите Nested VT-x/AMD-V в настройках гипервизора."
     error "Перезагрузите ВМ и запустите скрипт повторно."
 fi
 log "Поддержка KVM подтверждена."
 
+#------------------------------------------------------------------------------
+# 2. SSH-ключи
+#------------------------------------------------------------------------------
 log "Проверка SSH-ключа для пользователя '$REAL_USER'..."
 if [[ ! -f "$SSH_KEY" ]]; then
     log "Генерация пары ключей: $SSH_KEY"
@@ -58,9 +67,12 @@ else
 fi
 
 log "Добавление пользователя '$REAL_USER' в группу libvirt..."
-usermod -aG libvirt "$REAL_USER"
+usermod -aG libvirt "$REAL_USER" >/dev/null 2>&1
 log "Для применения изменений выполните: newgrp libvirt"
 
+#------------------------------------------------------------------------------
+# 3. Сеть и Firewall
+#------------------------------------------------------------------------------
 log "Включение IP-форвардинга..."
 echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-nested-virt.conf
 sysctl -p /etc/sysctl.d/99-nested-virt.conf >/dev/null 2>&1
@@ -76,24 +88,26 @@ fi
 
 log "Настройка DHCP-диапазона сети libvirt..."
 if ! virsh net-info "$NET_NAME" &>/dev/null; then
-    error "Сеть '$NET_NAME' не найдена. Убедитесь, что libvirt запущен."
+    error "Сеть '$NET_NAME' не найдена. Убедитесь, что libvirtd запущен."
 fi
 
-CURRENT_CONFIG=$(virsh net-dumpxml "$NET_NAME")
-if ! echo "$CURRENT_CONFIG" | grep -q "${DHCP_RANGE_START}"; then
-    log "Обновление DHCP-диапазона: ${DHCP_RANGE_START}-${DHCP_RANGE_END}"
-    virsh net-update "$NET_NAME" modify ip-dhcp-range \
-        "<range start='${DHCP_RANGE_START}' end='${DHCP_RANGE_END}'/>" \
-        --live --config >/dev/null 2>&1
-    log "DHCP-диапазон успешно обновлён."
-else
-    log "DHCP-диапазон уже настроен корректно."
-fi
+# Атомарное обновление без разрыва сети (безопаснее, чем net-destroy/start)
+virsh net-update "$NET_NAME" modify ip-dhcp-range \
+    "<range start='${DHCP_RANGE_START}' end='${DHCP_RANGE_END}'/>" \
+    --live --config 2>/dev/null || {
+    log "DHCP-диапазон уже настроен корректно или не требует изменений."
+}
 
+#------------------------------------------------------------------------------
+# 4. Базовый образ
+#------------------------------------------------------------------------------
 if [[ ! -f "$BASE_IMG" ]]; then
     log "Скачивание базового образа Ubuntu (~500 МБ)..."
     mkdir -p "$LIBVIRT_DIR"
-    curl -L -o "$BASE_IMG" "$BASE_IMG_URL"
+    curl -L --connect-timeout 10 --max-time 600 --progress-bar -o "$BASE_IMG" "$BASE_IMG_URL" || {
+        rm -f "$BASE_IMG"
+        error "Ошибка загрузки образа. Проверьте интернет-соединение."
+    }
     chmod 644 "$BASE_IMG"
     log "Образ сохранён: $BASE_IMG"
 else

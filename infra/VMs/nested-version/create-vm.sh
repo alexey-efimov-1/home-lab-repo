@@ -83,7 +83,6 @@ fi
 if [[ ! -f "$SSH_KEY_FILE" ]]; then
     error "SSH-ключ не найден: $SSH_KEY_FILE"
     error "Убедитесь, что пользователь '$REAL_USER' имеет ключ в ~/.ssh/id_ed25519.pub"
-    error "Или сгенерируйте его от имени '$REAL_USER': ssh-keygen -t ed25519"
 fi
 if virsh domstate "$VM_NAME" &>/dev/null; then
     error "ВМ '$VM_NAME' уже существует."
@@ -98,11 +97,12 @@ mkdir -p "$WORK_DIR"
 log "Рабочая директория: $WORK_DIR"
 
 #------------------------------------------------------------------------------
-# 1. Создание диска ВМ (backing-file для экономии места)
+# 1. Создание диска ВМ
 #------------------------------------------------------------------------------
 log "Создание диска ВМ..."
 VM_DISK="${LIBVIRT_DIR}/${VM_NAME}.qcow2"
-qemu-img create -f qcow2 -b "$BASE_IMG" -F qcow2 "$VM_DISK" "$DISK_SIZE" >/dev/null
+cp "$BASE_IMG" "$VM_DISK"
+qemu-img resize "$VM_DISK" "$DISK_SIZE" >/dev/null
 chown libvirt-qemu:kvm "$VM_DISK" 2>/dev/null || true
 
 #------------------------------------------------------------------------------
@@ -152,6 +152,7 @@ instance-id: ${VM_NAME}-$(date +%s)
 local-hostname: ${VM_NAME}
 EOF
 
+# Генерация конфигурации сети (обязательно для статического IP)
 cat > "${WORK_DIR}/network-config" <<EOF
 version: 2
 ethernets:
@@ -172,10 +173,12 @@ EOF
 # 3. Создание seed-ISO для cloud-init
 #------------------------------------------------------------------------------
 log "Создание cloud-init seed-ISO..."
-cloud-localds "${WORK_DIR}/seed.iso" \
+# Используем флаг -N для передачи network-config
+cloud-localds \
+    -N "${WORK_DIR}/network-config" \
+    "${WORK_DIR}/seed.iso" \
     "${WORK_DIR}/user-data" \
-    "${WORK_DIR}/meta-data" \
-    "${WORK_DIR}/network-config"
+    "${WORK_DIR}/meta-data"
 chown libvirt-qemu:kvm "${WORK_DIR}/seed.iso" 2>/dev/null || true
 
 #------------------------------------------------------------------------------

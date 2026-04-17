@@ -41,14 +41,20 @@ readonly GATEWAY="192.168.122.1"
 readonly NET_NAME="default"
 readonly DISK_SIZE="20G"
 
+# Путь для стабильного хранения seed.iso (ИСПРАВЛЕНИЕ)
+readonly SEED_PERM="${LIBVIRT_DIR}/${VM_NAME}-seed.iso"
+
 #------------------------------------------------------------------------------
 # Вспомогательные функции
 #------------------------------------------------------------------------------
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 error() { echo "[ERROR] $*" >&2; exit 1; }
+
+# ИСПРАВЛЕНИЕ: очищаем только временные конфиги, не трогая seed.iso и диск ВМ
 cleanup() {
     if [[ -n "${WORK_DIR:-}" && -d "$WORK_DIR" ]]; then
-        rm -rf "$WORK_DIR"
+        rm -f "${WORK_DIR}/user-data" "${WORK_DIR}/meta-data" "${WORK_DIR}/network-config" "${WORK_DIR}/seed.iso" 2>/dev/null || true
+        rmdir "$WORK_DIR" 2>/dev/null || true
     fi
 }
 trap cleanup EXIT
@@ -66,12 +72,10 @@ fi
 #------------------------------------------------------------------------------
 log "Проверка параметров..."
 
-# Валидация IP
 if ! [[ "$VM_IP" =~ ^192\.168\.122\.[0-9]{1,3}$ ]]; then
     error "IP должен быть в подсети 192.168.122.0/24"
 fi
 
-# Валидация MAC
 if ! [[ "$VM_MAC" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]]; then
     error "Неверный формат MAC-адреса: $VM_MAC"
 fi
@@ -153,7 +157,7 @@ packages:
   - git
   - python3
   - python3-pip
-  - python3-venv
+  - python3.12-venv
 runcmd:
   - systemctl enable ssh
   - systemctl restart ssh
@@ -182,7 +186,7 @@ ethernets:
 EOF
 
 #------------------------------------------------------------------------------
-# 3. Создание seed-ISO для cloud-init
+# 3. Создание seed-ISO и перемещение в стабильное хранилище
 #------------------------------------------------------------------------------
 log "Создание cloud-init seed-ISO..."
 cloud-localds \
@@ -190,7 +194,11 @@ cloud-localds \
     "${WORK_DIR}/seed.iso" \
     "${WORK_DIR}/user-data" \
     "${WORK_DIR}/meta-data"
-chown libvirt-qemu:kvm "${WORK_DIR}/seed.iso" 2>/dev/null || true
+
+# ИСПРАВЛЕНИЕ: перемещаем ISO в постоянное место до запуска ВМ
+mv "${WORK_DIR}/seed.iso" "$SEED_PERM"
+chown libvirt-qemu:kvm "$SEED_PERM" 2>/dev/null || true
+chmod 644 "$SEED_PERM"
 
 #------------------------------------------------------------------------------
 # 4. Запуск ВМ через virt-install
@@ -203,7 +211,7 @@ virt-install \
     --memory "$RAM" \
     --vcpus "$VCPUS" \
     --disk path="$VM_DISK",format=qcow2 \
-    --disk path="${WORK_DIR}/seed.iso",device=cdrom,readonly=on \
+    --disk path="$SEED_PERM",device=cdrom,readonly=on \
     --os-variant ubuntu24.04 \
     --import \
     --network network="$NET_NAME",mac="$VM_MAC" \

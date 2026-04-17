@@ -172,15 +172,19 @@ EOF
 cat > "${WORK_DIR}/network-config" <<EOF
 version: 2
 ethernets:
-  ens3:
+  eth0:  # ← имя-заглушка, важно только содержимое match
     match:
-      macaddress: ${VM_MAC}
+      macaddress: "${VM_MAC}"
+    set-name: eth0  # ← принудительно переименовываем интерфейс в eth0
     dhcp4: false
+    dhcp6: false
+    accept-ra: false
+    link-local: []
     addresses:
-      - ${VM_IP}/24
+      - "${VM_IP}/24"
     routes:
       - to: default
-        via: ${GATEWAY}
+        via: "${GATEWAY}"
     nameservers:
       addresses: [8.8.8.8, 1.1.1.1]
 EOF

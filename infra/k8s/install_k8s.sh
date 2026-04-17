@@ -69,6 +69,7 @@ fi
 
 # Копируем конфигурационный файл кластера на управляющую машину
 echo "Копируем kubeconfig..."
+rm -rf ~/.kube
 mkdir -p ~/.kube
 ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ansible@"${CONTROL_PLANE_IP}" \
     "sudo cat /etc/kubernetes/admin.conf" > ~/.kube/config

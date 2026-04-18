@@ -49,7 +49,7 @@ pip install -r "${KUBESPRAY_DIR}/requirements.txt"
 # Запускаем основной плейбук установки Kubernetes
 echo "Запускаем развертывание кластера..."
 cd "$KUBESPRAY_DIR"
-ansible-playbook -i inventory/mycluster/hosts.ini --user=ansible cluster.yml -b -vvv 
+ansible-playbook -i inventory/mycluster/hosts.ini --user=ansible cluster.yml -b 
 cd "$SCRIPT_DIR"
 
 snap install kubectl --classic

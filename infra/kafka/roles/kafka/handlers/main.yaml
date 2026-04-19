@@ -1,0 +1,10 @@
+---
+- name: Reload systemd daemon
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Перезапуск Kafka
+  ansible.builtin.systemd:
+    name: kafka
+    state: restarted
+  listen: "Перезапуск Kafka"

@@ -1,0 +1,149 @@
+---
+# ---------------------------------------------------------
+# ЭТАП 1: Предварительные требования (Java, пользователь)
+# ---------------------------------------------------------
+- name: Установка OpenJDK 17
+  ansible.builtin.package:
+    name: openjdk-17-jdk-headless
+    state: present
+  tags: kafka_prereq
+
+- name: Создание системной группы kafka
+  ansible.builtin.group:
+    name: "{{ kafka_group }}"
+    state: present
+
+- name: Создание системного пользователя kafka
+  ansible.builtin.user:
+    name: "{{ kafka_user }}"
+    group: "{{ kafka_group }}"
+    system: true
+    create_home: false
+    shell: /usr/sbin/nologin
+  tags: kafka_prereq
+
+# ---------------------------------------------------------
+# ЭТАП 2: Загрузка и распаковка дистрибутива
+# ---------------------------------------------------------
+- name: Скачивание архива Kafka
+  ansible.builtin.get_url:
+    url: "{{ kafka_download_url }}"
+    dest: "/tmp/kafka-{{ kafka_version }}.tgz"
+    mode: "0644"
+    timeout: 30
+    force: false
+  register: kafka_download_result
+  until: kafka_download_result is succeeded
+  retries: 3
+  delay: 10
+  tags: kafka_install
+
+- name: Распаковка в /opt/
+  ansible.builtin.unarchive:
+    src: "/tmp/kafka-{{ kafka_version }}.tgz"
+    dest: /opt/
+    remote_src: true
+    creates: "/opt/kafka_{{ kafka_scala_version }}-{{ kafka_version }}/bin"
+  tags: kafka_install
+
+- name: Создание симлинка для удобства путей
+  ansible.builtin.file:
+    src: "/opt/kafka_{{ kafka_scala_version }}-{{ kafka_version }}"
+    dest: "{{ kafka_install_dir }}"
+    state: link
+  tags: kafka_install
+
+- name: Назначение прав на директории установки и данных
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ kafka_user }}"
+    group: "{{ kafka_group }}"
+    recurse: true
+  loop:
+    - "{{ kafka_install_dir }}"
+    - "{{ kafka_data_dir }}"
+  tags: kafka_install
+
+# ---------------------------------------------------------
+# ЭТАП 3: Генерация единого UUID для KRaft кластера
+# Выполняется один раз на первом хосте, результат шарится всем
+# ---------------------------------------------------------
+- name: Генерация KRaft Cluster UUID
+  ansible.builtin.command: "{{ kafka_install_dir }}/bin/kafka-storage.sh random-uuid"
+  register: kafka_uuid_cmd
+  run_once: true
+  changed_when: false
+  tags: kafka_config
+
+- name: Сохранение UUID в переменную роли
+  ansible.builtin.set_fact:
+    kafka_cluster_uuid: "{{ kafka_uuid_cmd.stdout }}"
+  run_once: true
+  tags: kafka_config
+
+# ---------------------------------------------------------
+# ЭТАП 4: Деплой конфигурации server.properties
+# Jinja2-шаблон динамически считает ноды и подстраивает репликацию
+# ---------------------------------------------------------
+- name: Генерация конфигурации KRaft
+  ansible.builtin.template:
+    src: server.properties.j2
+    dest: "{{ kafka_install_dir }}/config/server.properties"
+    owner: "{{ kafka_user }}"
+    group: "{{ kafka_group }}"
+    mode: "0644"
+  notify: Перезапуск Kafka
+  tags: kafka_config
+
+# ---------------------------------------------------------
+# ЭТАП 5: Инициализация хранилища метаданных (KRaft Format)
+# ИСПРАВЛЕНО: Убран become_user, команда выполняется от root
+# ---------------------------------------------------------
+- name: Проверка наличия файла meta.properties
+  ansible.builtin.stat:
+    path: "{{ kafka_data_dir }}/meta.properties"
+  register: kraft_meta_stat
+
+- name: Форматирование хранилища KRaft
+  ansible.builtin.command: >
+    {{ kafka_install_dir }}/bin/kafka-storage.sh format
+    -t {{ kafka_cluster_uuid }}
+    -c {{ kafka_install_dir }}/config/server.properties
+  args:
+    creates: "{{ kafka_data_dir }}/meta.properties"
+  # Запускаем от root (наследует become: true из playbook)
+  # Директория уже принадлежит пользователю kafka, root имеет к ней доступ
+  when: not kraft_meta_stat.stat.exists
+  notify: Перезапуск Kafka
+  tags: kafka_config
+
+# ---------------------------------------------------------
+# ЭТАП 6: Настройка systemd unit-файла
+# ---------------------------------------------------------
+- name: Деплой systemd unit для Kafka
+  ansible.builtin.template:
+    src: kafka.service.j2
+    dest: /etc/systemd/system/kafka.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload systemd daemon
+  tags: kafka_service
+
+- name: Запуск и добавление Kafka в автозагрузку
+  ansible.builtin.systemd:
+    name: kafka
+    state: started
+    enabled: true
+  tags: kafka_service
+
+# ---------------------------------------------------------
+# ЭТАП 7: Пост-проверка (Healthcheck)
+# Ожидание открытия порта брокера перед завершением плейбука
+# ---------------------------------------------------------
+- name: Ожидание доступности порта {{ kafka_broker_port }}
+  ansible.builtin.wait_for:
+    port: "{{ kafka_broker_port }}"
+    timeout: 45
+  tags: kafka_verify

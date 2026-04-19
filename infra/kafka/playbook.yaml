@@ -1,0 +1,8 @@
+---
+- name: Установка Apache Kafka (KRaft)
+  hosts: kafka
+  become: true
+  gather_facts: true
+  
+  roles:
+    - role: kafka

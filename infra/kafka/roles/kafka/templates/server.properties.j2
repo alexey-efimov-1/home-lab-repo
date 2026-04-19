@@ -1,0 +1,31 @@
+# Базовые настройки KRaft
+node.id={{ ansible_play_hosts_all.index(inventory_hostname) + 1 }}
+process.roles=broker,controller
+
+# Динамическая сборка списка контроллеров
+# Формат: id@host:port,id@host:port,...
+controller.quorum.voters={% for host in ansible_play_hosts_all %}{{ loop.index }}@{{ hostvars[host].ansible_host | default(host) }}:{{ kafka_controller_port }}{% if not loop.last %},{% endif %}{% endfor %}
+
+# Слушатели
+listeners=PLAINTEXT://:{{ kafka_broker_port }},CONTROLLER://:{{ kafka_controller_port }}
+advertised.listeners=PLAINTEXT://{{ ansible_host }}:{{ kafka_broker_port }}
+inter.broker.listener.name=PLAINTEXT
+controller.listener.names=CONTROLLER
+listener.security.protocol.map=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+
+# Хранение логов
+log.dirs={{ kafka_data_dir }}
+log.retention.hours=168
+
+# Репликация: автоматически выбирает min(кол-во хостов, 3)
+# Для standalone будет 1, для кластера 2 или 3.
+offsets.topic.replication.factor={{ [ansible_play_hosts_all | length, 3] | min }}
+transaction.state.log.replication.factor={{ [ansible_play_hosts_all | length, 3] | min }}
+min.insync.replicas=1
+
+# Производительность (дефолтные значения подходят для домашней лабы)
+num.network.threads=3
+num.io.threads=8
+socket.send.buffer.bytes=102400
+socket.receive.buffer.bytes=102400
+socket.request.max.bytes=104857600

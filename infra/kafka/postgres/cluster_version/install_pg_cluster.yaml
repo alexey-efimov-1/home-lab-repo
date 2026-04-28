@@ -1,0 +1,269 @@
+- name: Развёртывание HA кластера PostgreSQL + Patroni + etcd
+  hosts: pg_cluster
+  become: true
+  gather_facts: true
+  vars_files:
+    - group_vars/all.yml
+
+  handlers:
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: true
+
+    - name: Restart etcd
+      systemd:
+        name: etcd
+        state: restarted
+
+  tasks:
+    - name: Установка базовых зависимостей и PostgreSQL из стандартных репозиториев
+      apt:
+        name:
+          - python3-pip
+          - python3-dev
+          - libpq-dev
+          - postgresql-{{ pg_version }}
+          - postgresql-contrib-{{ pg_version }}
+          - curl
+          - jq
+          - lsb-release
+          - apt-transport-https
+          - ca-certificates
+          - python3-psycopg2
+          - acl
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Остановка и отключение стандартного PostgreSQL (управляемого systemd)
+      systemd:
+        name: "postgresql@{{ pg_version }}-main"
+        state: stopped
+        enabled: false
+      failed_when: false
+
+    - name: Загрузка бинарного файла etcd
+      get_url:
+        url: "https://github.com/etcd-io/etcd/releases/download/v3.5.16/etcd-v3.5.16-linux-amd64.tar.gz"
+        dest: "/tmp/etcd.tar.gz"
+        mode: "0644"
+
+    - name: Распаковка etcd
+      unarchive:
+        src: "/tmp/etcd.tar.gz"
+        dest: "/tmp/"
+        remote_src: true
+
+    - name: Копирование бинарников etcd
+      copy:
+        src: "/tmp/etcd-v3.5.16-linux-amd64/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        mode: "0755"
+        remote_src: true
+      loop:
+        - etcd
+        - etcdctl
+
+    - name: Создание пользователя etcd
+      user:
+        name: etcd
+        system: true
+        shell: /usr/sbin/nologin
+        create_home: false
+
+    - name: Создание директории для данных etcd
+      file:
+        path: /var/lib/etcd/default
+        state: directory
+        owner: etcd
+        group: etcd
+        mode: "0700"
+      notify: Restart etcd
+
+    - name: Создание директории для конфигурации etcd
+      file:
+        path: /etc/etcd
+        state: directory
+        owner: root
+        group: etcd
+        mode: "0750"
+
+    - name: Копирование конфигурации etcd
+      template:
+        src: templates/etcd.conf.j2
+        dest: /etc/etcd/etcd.conf
+        owner: root
+        group: etcd
+        mode: "0640"
+      notify: Restart etcd
+
+    - name: Создание systemd unit для etcd
+      copy:
+        dest: /etc/systemd/system/etcd.service
+        content: |
+          [Unit]
+          Description=etcd key-value store
+          After=network.target
+
+          [Service]
+          Type=notify
+          User=etcd
+          Group=etcd
+          EnvironmentFile=/etc/etcd/etcd.conf
+          ExecStart=/usr/local/bin/etcd
+          Restart=always
+          RestartSec=5
+          LimitNOFILE=65536
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Reload systemd daemon
+
+    - name: Запуск etcd
+      systemd:
+        name: etcd
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Ожидание готовности кластера etcd (v3 API)
+      uri:
+        url: "http://{{ ansible_host }}:{{ etcd_client_port }}/health"
+        return_content: true
+        status_code: 200
+      register: etcd_health
+      retries: 15
+      delay: 4
+      until: etcd_health.status == 200 and '"health":"true"' in etcd_health.content
+
+    - name: Установка Patroni через pip (с поддержкой etcd3)
+      pip:
+        name:
+          - "patroni[etcd3]"
+          - "psycopg2-binary"
+          - "etcd3"
+        state: present
+        executable: pip3
+        extra_args: "--break-system-packages --ignore-installed typing_extensions"
+      register: patroni_install
+      retries: 3
+      delay: 5
+      until: patroni_install is succeeded
+
+    - name: Полная очистка каталога данных от авто-инициализации apt
+      file:
+        path: "{{ pg_data_dir }}"
+        state: absent
+      failed_when: false
+
+    - name: Создание пустого каталога данных PostgreSQL
+      file:
+        path: "{{ pg_data_dir }}"
+        state: directory
+        owner: postgres
+        group: postgres
+        mode: "0700" 
+
+    - name: Создание директории конфигурации Patroni
+      file:
+        path: /etc/patroni
+        state: directory
+        owner: postgres 
+        group: postgres
+        mode: "0750"
+
+    - name: Копирование конфигурации Patroni
+      template:
+        src: templates/patroni.yml.j2
+        dest: /etc/patroni/patroni.yml
+        owner: postgres
+        group: postgres
+        mode: "0640"
+
+    - name: Создание systemd unit для Patroni
+      copy:
+        dest: /etc/systemd/system/patroni.service
+        content: |
+          [Unit]
+          Description=Patroni High Availability PostgreSQL
+          After=network.target etcd.service
+
+          [Service]
+          Type=simple
+          User=postgres       
+          Group=postgres
+          Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+          ExecStart=/usr/local/bin/patroni /etc/patroni/patroni.yml
+          ExecReload=/bin/kill -HUP $MAINPID
+          Restart=always
+          RestartSec=5
+          LimitNOFILE=65536
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: Reload systemd daemon
+
+    - name: Запуск Patroni
+      systemd:
+        name: patroni
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Ожидание запуска PostgreSQL на всех узлах
+      wait_for:
+        port: 5432
+        timeout: 90
+
+    - name: Поиск лидера — возвращаем inventory_hostname
+      shell: |
+        {% for h in groups['pg_cluster'] %}
+        if curl -sf --connect-timeout 2 http://{{ hostvars[h].ansible_host | default(h) }}:{{ patroni_api_port }}/leader >/dev/null 2>&1; then
+          echo "{{ h }}"
+          exit 0
+        fi
+        {% endfor %}
+        echo "Leader not found" >&2
+        exit 1
+      register: leader_result
+      changed_when: false
+      run_once: true          # Выполняется только на первом хосте группы
+      retries: 30
+      delay: 5
+      until: leader_result.rc == 0
+
+    - name: Распространение имени лидера на все узлы
+      set_fact:
+        # Забираем результат с первого хоста, где он был зарегистрирован
+        leader_hostname: "{{ hostvars[groups['pg_cluster'][0]].leader_result.stdout | trim }}"
+
+    # =============================================================================
+    # Блок: Инициализация БД main_db и пользователя admin
+    # =============================================================================
+
+    - name: Создание пользователя (только на лидере)
+      community.postgresql.postgresql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_password }}"
+        state: present
+        role_attr_flags: "SUPERUSER"
+      become_user: postgres
+      when: inventory_hostname == leader_hostname
+
+    - name: Создание базы данных {{ db_name }} (только на лидере)
+      community.postgresql.postgresql_db:
+        name: "{{ db_name }}"
+        owner: "{{ db_user }}"
+        state: present
+        encoding: UTF-8
+      become_user: postgres
+      when: inventory_hostname == leader_hostname
+
+    - name: Выдача прав (только на лидере)
+      community.postgresql.postgresql_privs:
+        db: "{{ db_name }}"
+        role: "{{ db_user }}"
+        privs: ALL
+        type: database
+      become_user: postgres
+      when: inventory_hostname == leader_hostname

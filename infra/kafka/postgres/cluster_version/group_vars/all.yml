@@ -1,0 +1,20 @@
+# Общие параметры
+pg_version: "16"
+cluster_name: "pg_ha"
+patroni_api_port: 8008
+pg_data_dir: "/var/lib/postgresql/{{ pg_version }}/main"
+
+# Параметры БД
+db_name: "main_db"
+db_user: "admin"
+db_password: "admin"
+
+# Сетевые параметры etcd
+etcd_client_port: 2379
+etcd_peer_port: 2380
+
+# Генерация списка endpoint'ов etcd
+etcd_endpoints: >-
+  {{ groups['pg_cluster'] | map('extract', hostvars, 'ansible_host') |
+     map('regex_replace', '(.+)', 'http://\\1:' + etcd_client_port | string) |
+     join(',') }}

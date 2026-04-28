@@ -1,0 +1,83 @@
+---
+- name: Установка и настройка PostgreSQL (standalone) на Ubuntu
+  hosts: pg_servers
+  become: true
+  vars:
+    pg_db_name: main_db
+    pg_user_name: admin
+    pg_user_password: admin
+    pg_allow_subnet: "192.168.122.0/24"
+
+  tasks:
+    - name: Установка системных зависимостей (acl + python libs)
+      ansible.builtin.apt:
+        name:
+          - acl
+          - python3-psycopg2
+          - postgresql
+          - postgresql-contrib
+        state: present
+        update_cache: true
+
+    - name: Запуск и автозапуск службы PostgreSQL
+      ansible.builtin.systemd:
+        name: postgresql
+        state: started
+        enabled: true
+
+    - name: Определение версии установленного PostgreSQL
+      ansible.builtin.command: pg_lsclusters --no-header
+      register: pg_clusters
+      changed_when: false
+      check_mode: false
+
+    - name: Установка переменной версии PostgreSQL
+      ansible.builtin.set_fact:
+        pg_version: "{{ pg_clusters.stdout_lines[0].split()[0] }}"
+      when: pg_clusters.stdout_lines | length > 0
+
+    - name: Настройка listen_addresses в postgresql.conf
+      ansible.builtin.lineinfile:
+        path: "/etc/postgresql/{{ pg_version }}/main/postgresql.conf"
+        regexp: "^#?listen_addresses"
+        line: "listen_addresses = '*'"
+        state: present
+      notify: Reload PostgreSQL
+
+    - name: Разрешение подключений из подсети в pg_hba.conf
+      ansible.builtin.lineinfile:
+        path: "/etc/postgresql/{{ pg_version }}/main/pg_hba.conf"
+        line: "host all all {{ pg_allow_subnet }} scram-sha-256"
+        insertbefore: "^# IPv4 local connections:"
+        state: present
+      notify: Reload PostgreSQL
+
+    - name: Создание пользователя PostgreSQL
+      community.postgresql.postgresql_user:
+        name: "{{ pg_user_name }}"
+        password: "{{ pg_user_password }}"
+        state: present
+        role_attr_flags: "SUPERUSER"
+      become_user: postgres
+
+    - name: Создание базы данных {{ pg_db_name }}
+      community.postgresql.postgresql_db:
+        name: "{{ pg_db_name }}"
+        owner: "{{ pg_user_name }}"
+        state: present
+        encoding: UTF-8
+      become_user: postgres
+
+    - name: Явное назначение полных прав на БД
+      community.postgresql.postgresql_privs:
+        db: "{{ pg_db_name }}"
+        role: "{{ pg_user_name }}"
+        privs: ALL
+        type: database
+      become_user: postgres
+
+  handlers:
+    - name: Reload PostgreSQL
+      ansible.builtin.systemd:
+        name: postgresql
+        state: reloaded
